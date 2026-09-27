@@ -13,6 +13,21 @@
           "name": "run-adb",
           "cmd": "adb",
           "args": true
+        },
+        {
+          "name": "run-powershell",
+          "cmd": "powershell",
+          "args": true
+        },
+        {
+          "name": "run-pkexec",
+          "cmd": "pkexec",
+          "args": true
+        },
+        {
+          "name": "run-brew",
+          "cmd": "brew",
+          "args": true
         }
       ]
     },
