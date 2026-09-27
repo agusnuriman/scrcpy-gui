@@ -1,0 +1,54 @@
+name: Release Multiplatform
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: 'macos-latest' # Menghasilkan .dmg
+            args: '--target aarch64-apple-darwin'
+          - platform: 'ubuntu-22.04' # Menghasilkan .deb & AppImage
+            args: ''
+          - platform: 'windows-latest' # Menghasilkan .msi / .exe
+            args: ''
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux Dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install Frontend Dependencies
+        run: npm install
+
+      - name: Build Tauri App
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Scrcpy Wireless Manager ${{ github.ref_name }}'
+          releaseBody: 'Rilis otomatis multi-platform (Linux, Windows, macOS).'
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
