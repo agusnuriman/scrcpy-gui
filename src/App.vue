@@ -3,12 +3,22 @@ import { ref, onMounted, computed } from "vue";
 import { Command } from "@tauri-apps/plugin-shell";
 
 const os = ref("linux");
+const arch = ref("x86_64");
 const isCheckingDeps = ref(true);
 const dependenciesReady = ref(false);
 const missingDeps = ref([]);
 const isInstalling = ref(false);
 const installLogs = ref("");
 const usingFallback = ref(false);
+const scrcpyVersion = ref("");
+const isUpdating = ref(false);
+const portableBin = ref(localStorage.getItem("scrcpy_portable_bin") || "");
+
+const SCRCPY_REPO_API =
+  "https://api.github.com/repos/Genymobile/scrcpy/releases/latest";
+// Portable install root. Fixed per platform so the binary and its matching
+// scrcpy-server always stay in the same directory.
+const PORTABLE_DIR_UNIX = "$HOME/.local/share/scrcpy-gui/portable";
 
 const activeTab = ref("connect");
 const ipAddress = ref(localStorage.getItem("scrcpy_ip") || "192.168.1.");
@@ -62,7 +72,17 @@ function createAdbCommand(args) {
   return Command.create("run-adb", args);
 }
 
+// Shell scope only allowlists the literal name `scrcpy`, so an absolute path
+// (the portable install) has to be launched through bash/powershell instead.
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
 function createScrcpyCommand(args) {
+  if (portableBin.value && os.value !== "windows") {
+    const command = [portableBin.value, ...args].map(shellQuote).join(" ");
+    return Command.create("run-bash", ["-c", `exec ${command}`]);
+  }
   if (usingFallback.value && os.value === "windows") {
     const psArgs = [
       "-NoProfile",
@@ -78,6 +98,25 @@ async function checkDependencies() {
   isCheckingDeps.value = true;
   missingDeps.value = [];
   os.value = detectOS();
+  arch.value = await detectArchitecture();
+
+  // Drop a portable install that no longer runs, so the system binary is used.
+  if (portableBin.value && os.value !== "windows") {
+    const probe = await Command.create("run-bash", [
+      "-c",
+      `exec ${shellQuote(portableBin.value)} --version`,
+    ])
+      .execute()
+      .catch(() => null);
+    if (!probe || probe.code !== 0) {
+      logInstall(
+        "[WARN] Portable scrcpy is unusable. Falling back to system binary.",
+      );
+      portableBin.value = "";
+      localStorage.removeItem("scrcpy_portable_bin");
+    }
+  }
+
   logInstall("[INFO] Checking ADB installation...");
 
   try {
@@ -99,12 +138,19 @@ async function checkDependencies() {
     const scrcpyCheck = createScrcpyCommand(["--version"]);
     const scrcpyOut = await scrcpyCheck.execute();
     if (scrcpyOut.code !== 0) {
+      scrcpyVersion.value = "";
       missingDeps.value.push("scrcpy");
       logInstall("[FAIL] Scrcpy not found.");
     } else {
-      logInstall("[PASS] Scrcpy found.");
+      scrcpyVersion.value = parseScrcpyVersion(scrcpyOut.stdout);
+      logInstall(
+        scrcpyVersion.value
+          ? `[PASS] Scrcpy ${scrcpyVersion.value} found.`
+          : "[PASS] Scrcpy found.",
+      );
     }
   } catch {
+    scrcpyVersion.value = "";
     missingDeps.value.push("scrcpy");
     logInstall("[FAIL] Scrcpy not found.");
   }
@@ -198,6 +244,278 @@ async function installDependencies() {
     logInstall(`[ERR] Installation failed: ${err}`);
   } finally {
     isInstalling.value = false;
+  }
+}
+
+async function detectArchitecture() {
+  try {
+    if (os.value === "windows") {
+      const out = await Command.create("run-powershell", [
+        "-NoProfile",
+        "-Command",
+        "$env:PROCESSOR_ARCHITECTURE",
+      ]).execute();
+      const raw = (out.stdout || "").trim().toLowerCase();
+      if (raw === "arm64") return "arm64";
+      if (raw === "x86") return "x86";
+      return "x86_64";
+    }
+    const out = await Command.create("run-bash", ["-c", "uname -m"]).execute();
+    const raw = (out.stdout || "").trim().toLowerCase();
+    if (raw === "arm64" || raw === "aarch64") return "arm64";
+    return raw || "x86_64";
+  } catch {
+    return "x86_64";
+  }
+}
+
+function parseScrcpyVersion(text) {
+  const match = /scrcpy\s+(\d+\.\d+(?:\.\d+)?)/i.exec(text || "");
+  return match ? match[1] : "";
+}
+
+function versionParts(value) {
+  return String(value || "0")
+    .replace(/^v/, "")
+    .split(".")
+    .map((part) => parseInt(part, 10) || 0);
+}
+
+function isNewerVersion(candidate, current) {
+  const next = versionParts(candidate);
+  const now = versionParts(current);
+  for (let i = 0; i < Math.max(next.length, now.length); i += 1) {
+    const a = next[i] || 0;
+    const b = now[i] || 0;
+    if (a !== b) return a > b;
+  }
+  return false;
+}
+
+async function fetchLatestScrcpyRelease() {
+  if (os.value === "windows") {
+    const script =
+      "$ProgressPreference = 'SilentlyContinue'; " +
+      `(Invoke-WebRequest -UseBasicParsing -Uri "${SCRCPY_REPO_API}" ` +
+      '-Headers @{ "Accept" = "application/vnd.github+json"; "User-Agent" = "scrcpy-gui" }).Content';
+    const out = await Command.create("run-powershell", [
+      "-NoProfile",
+      "-Command",
+      script,
+    ]).execute();
+    return JSON.parse(out.stdout);
+  }
+  const script = `curl -fsSL -H "Accept: application/vnd.github+json" -H "User-Agent: scrcpy-gui" ${shellQuote(SCRCPY_REPO_API)}`;
+  const out = await Command.create("run-bash", ["-c", script]).execute();
+  return JSON.parse(out.stdout);
+}
+
+// Returns null when upstream publishes no usable build for this platform, or
+// when the asset carries no sha256 digest. Unverified binaries are never run.
+function pickScrcpyAsset(release) {
+  const tag = String(release.tag_name || "");
+  if (!/^v?\d+(\.\d+)*$/.test(tag)) return null;
+
+  let wanted;
+  if (os.value === "windows") {
+    wanted =
+      arch.value === "x86"
+        ? `scrcpy-win32-${tag}.zip`
+        : `scrcpy-win64-${tag}.zip`;
+  } else if (os.value === "macos") {
+    wanted = `scrcpy-macos-${arch.value === "arm64" ? "aarch64" : "x86_64"}-${tag}.tar.gz`;
+  } else {
+    wanted = `scrcpy-linux-${arch.value === "arm64" ? "aarch64" : "x86_64"}-${tag}.tar.gz`;
+  }
+
+  const asset = (release.assets || []).find((item) => item.name === wanted);
+  if (!asset) return null;
+
+  const digest = String(asset.digest || "");
+  const sha256 = digest.startsWith("sha256:")
+    ? digest.slice(7).toLowerCase()
+    : "";
+  if (!/^[0-9a-f]{64}$/.test(sha256)) return null;
+
+  return { tag, name: asset.name, url: asset.browser_download_url, sha256 };
+}
+
+function portableUnixScript(target) {
+  return [
+    "set -eu",
+    `BASE=${PORTABLE_DIR_UNIX}`,
+    `DEST="$BASE/${target.tag}"`,
+    'TMP="$(mktemp -d)"',
+    `trap 'rm -rf "$TMP"' EXIT`,
+    'mkdir -p "$BASE"',
+    `echo "[INFO] Downloading ${target.name}..."`,
+    `curl -fsSL --retry 2 --connect-timeout 20 -o "$TMP/payload" ${shellQuote(target.url)}`,
+    "if command -v sha256sum >/dev/null 2>&1; then",
+    `  GOT="$(sha256sum "$TMP/payload" | cut -d' ' -f1)"`,
+    "else",
+    `  GOT="$(shasum -a 256 "$TMP/payload" | cut -d' ' -f1)"`,
+    "fi",
+    `if [ "$GOT" != "${target.sha256}" ]; then`,
+    `  echo "[FAIL] sha256 mismatch: expected ${target.sha256}, got $GOT"`,
+    "  exit 1",
+    "fi",
+    'echo "[PASS] sha256 verified."',
+    'echo "[INFO] Extracting payload..."',
+    'rm -rf "$DEST"',
+    'mkdir -p "$DEST"',
+    'tar xzf "$TMP/payload" -C "$DEST" --strip-components=1',
+    `find "$BASE" -mindepth 1 -maxdepth 1 -type d ! -name ${JSON.stringify(target.tag)} -exec rm -rf {} +`,
+    'if [ ! -x "$DEST/scrcpy" ]; then',
+    '  echo "[FAIL] scrcpy binary missing after extraction."',
+    "  exit 1",
+    "fi",
+    'echo "[PATH] $DEST/scrcpy"',
+  ].join("\n");
+}
+
+function portableWindowsScript(target) {
+  return `
+$ErrorActionPreference = 'Stop';
+$ProgressPreference = 'SilentlyContinue';
+$dir = "$env:LOCALAPPDATA\\scrcpy-gui\\bin";
+$zip = "$env:TEMP\\scrcpy-${target.tag}.zip";
+$tmp = "$env:TEMP\\scrcpy-unpack";
+New-Item -ItemType Directory -Force -Path $dir | Out-Null;
+Write-Host "[INFO] Downloading ${target.name}...";
+Invoke-WebRequest -Uri "${target.url}" -OutFile $zip;
+$got = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower();
+if ($got -ne "${target.sha256}") {
+  Write-Host "[FAIL] sha256 mismatch: expected ${target.sha256}, got $got";
+  exit 1;
+}
+Write-Host "[PASS] sha256 verified.";
+Write-Host "[INFO] Extracting payload...";
+if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force; }
+Expand-Archive -Path $zip -DestinationPath $tmp -Force;
+$sub = Get-ChildItem -Directory $tmp | Select-Object -First 1;
+if ($sub) { Copy-Item -Path "$($sub.FullName)\\*" -Destination $dir -Recurse -Force; }
+Remove-Item $tmp -Recurse -Force;
+Remove-Item $zip -Force;
+Write-Host "[PATH] $dir\\scrcpy.exe";
+`;
+}
+
+async function installPortableScrcpy(target) {
+  const script =
+    os.value === "windows"
+      ? portableWindowsScript(target)
+      : portableUnixScript(target);
+  const cmd =
+    os.value === "windows"
+      ? Command.create("run-powershell", ["-NoProfile", "-Command", script])
+      : Command.create("run-bash", ["-c", script]);
+
+  cmd.on("stdout", (line) => {
+    statusLog.value += line;
+  });
+  cmd.on("stderr", (line) => {
+    statusLog.value += line;
+  });
+
+  const out = await cmd.execute();
+  if (out.code !== 0) return false;
+
+  const path = /\[PATH\]\s*(.+)/.exec(out.stdout || "");
+  if (!path) return false;
+
+  if (os.value === "windows") {
+    usingFallback.value = true;
+  } else {
+    portableBin.value = path[1].trim();
+  }
+  localStorage.setItem("scrcpy_portable_bin", portableBin.value);
+  return true;
+}
+
+async function updateViaPackageManager() {
+  if (os.value === "linux") {
+    logInstall("[INFO] Requesting root privileges for apt upgrade...");
+    const refresh = Command.create("run-pkexec", ["apt-get", "update"]);
+    refresh.on("stdout", logInstall);
+    refresh.on("stderr", logInstall);
+    await refresh.execute();
+
+    const upgrade = Command.create("run-pkexec", [
+      "apt-get",
+      "install",
+      "-y",
+      "--only-upgrade",
+      "scrcpy",
+      "adb",
+    ]);
+    upgrade.on("stdout", logInstall);
+    upgrade.on("stderr", logInstall);
+    const out = await upgrade.execute();
+    return out.code === 0;
+  }
+
+  if (os.value === "macos") {
+    logInstall("[INFO] Upgrading via Homebrew...");
+    const cmd = Command.create("run-brew", ["upgrade", "scrcpy"]);
+    cmd.on("stdout", logInstall);
+    cmd.on("stderr", logInstall);
+    const out = await cmd.execute();
+    return out.code === 0;
+  }
+
+  return false;
+}
+
+async function checkScrcpyUpdate() {
+  if (isUpdating.value) return;
+
+  isUpdating.value = true;
+  statusLog.value = "[INFO] Querying upstream scrcpy release feed...";
+  installLogs.value = "";
+
+  try {
+    const release = await fetchLatestScrcpyRelease();
+    const latest = String(release.tag_name || "").replace(/^v/, "");
+    statusLog.value += `\n[INFO] Installed: ${scrcpyVersion.value || "unknown"} | Upstream: ${latest}`;
+
+    if (!isNewerVersion(latest, scrcpyVersion.value)) {
+      statusLog.value += "\n[PASS] Already running the newest release.";
+      return;
+    }
+
+    const target = pickScrcpyAsset(release);
+    if (!target) {
+      statusLog.value += `\n[WARN] Upstream has no verified build for ${os.value}/${arch.value}. Using the system package manager instead.`;
+      installLogs.value = "";
+      const ok = await updateViaPackageManager();
+      statusLog.value += installLogs.value;
+      statusLog.value += ok
+        ? "\n[PASS] System package manager finished."
+        : "\n[FAIL] System package manager reported an error.";
+      return;
+    }
+
+    statusLog.value += `\n[INFO] Installing scrcpy ${target.tag} in portable mode...`;
+    const ok = await installPortableScrcpy(target);
+
+    if (!ok) {
+      statusLog.value +=
+        "\n[WARN] Portable install failed. Falling back to the system package manager.";
+      installLogs.value = "";
+      const fallback = await updateViaPackageManager();
+      statusLog.value += installLogs.value;
+      statusLog.value += fallback
+        ? "\n[PASS] System package manager finished."
+        : "\n[FAIL] System package manager reported an error.";
+    } else {
+      statusLog.value += `\n[PASS] scrcpy ${target.tag} is now active.`;
+    }
+
+    await checkDependencies();
+  } catch (err) {
+    statusLog.value += `\n[ERR] Update check failed: ${err}`;
+  } finally {
+    isUpdating.value = false;
   }
 }
 
@@ -312,7 +630,15 @@ async function disconnectADB() {
 async function startScrcpy() {
   statusLog.value = "[INFO] Booting Scrcpy runtime engine...";
   try {
-    const cmd = createScrcpyCommand(["-m", "1024", "-b", "4M", "--no-audio", "--max-fps", "60"]);
+    const cmd = createScrcpyCommand([
+      "-m",
+      "1024",
+      "-b",
+      "4M",
+      "--no-audio",
+      "--max-fps",
+      "60",
+    ]);
     await cmd.spawn();
     statusLog.value = "[PASS] Scrcpy engine deployed successfully.";
   } catch (err) {
@@ -339,7 +665,7 @@ onMounted(() => {
         <div class="control-btn maximize"></div>
       </div>
       <div class="window-title" data-tauri-drag-region>scrcpy-gui</div>
-      <div class="window-platform">{{ os }} / x86_64</div>
+      <div class="window-platform">{{ os }} / {{ arch }}</div>
     </div>
 
     <div class="container">
@@ -700,6 +1026,37 @@ onMounted(() => {
             Pair Device
           </button>
         </div>
+
+        <!-- Engine Updates -->
+        <div class="engine-row mt-4">
+          <div class="engine-info">
+            <span class="section-header">SCRCPY ENGINE</span>
+            <span class="engine-value">
+              {{ scrcpyVersion ? "v" + scrcpyVersion : "version unknown" }}
+            </span>
+          </div>
+          <button
+            class="btn btn-neutral btn-inline"
+            :disabled="isUpdating"
+            @click="checkScrcpyUpdate"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              width="14"
+              height="14"
+              stroke="currentColor"
+              stroke-width="2"
+              fill="none"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="12" y1="15" x2="12" y2="3" />
+            </svg>
+            {{ isUpdating ? "Checking..." : "Check for updates" }}
+          </button>
+        </div>
       </div>
 
       <!-- TERMINAL CONSOLE -->
@@ -715,7 +1072,7 @@ onMounted(() => {
       <!-- FOOTER -->
       <div class="app-footer mt-4">
         <div>Tauri v2 • Native IPC Ready</div>
-        <div>Arch: x86_64 • scrcpy-core</div>
+        <div>Arch: {{ arch }} • scrcpy {{ scrcpyVersion || "unknown" }}</div>
       </div>
     </div>
   </div>
@@ -1096,6 +1453,32 @@ input:focus {
 }
 .btn-neutral:hover:not(:disabled) {
   background: var(--btn-neutral-hover);
+}
+
+/* Engine update row */
+.engine-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 12px;
+}
+.engine-info {
+  display: flex;
+  flex-direction: column;
+}
+.engine-info .section-header {
+  margin-bottom: 2px;
+}
+.engine-value {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-primary);
+}
+.btn-inline {
+  width: auto;
+  flex-shrink: 0;
 }
 
 /* Terminal Console */
