@@ -28,6 +28,11 @@
           "name": "run-brew",
           "cmd": "brew",
           "args": true
+        },
+        {
+          "name": "run-scrcpy",
+          "cmd": "scrcpy",
+          "args": true
         }
       ]
     },
