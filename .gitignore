@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local design notes, not published
+DESIGN.md
+scrcpy_wireless_manager_design.md
